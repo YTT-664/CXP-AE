@@ -1,0 +1,177 @@
+import random
+import torch
+import torchvision
+from torch import nn
+import torch.nn.functional as F
+from torchvision import transforms
+import PIL.ImageOps
+from PIL import Image
+from torch.utils.data import DataLoader
+import modules
+import time
+import matplotlib.pyplot as plt  # 添加matplotlib库
+import os  # 添加os库用于目录操作
+import PIL.ImageOps
+from PIL import Image
+from PIL import ImageFile
+
+def main():
+    
+    os.makedirs("loss_plots", exist_ok=True)
+    os.makedirs("reconstruction_comparisons", exist_ok=True)
+    
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    transform = transforms.Compose([
+        transforms.Resize([430, 430]),
+        transforms.RandomCrop([416, 416]),
+        #transforms.RandomHorizontalFlip(p=0.5),
+        #transforms.RandomRotation(degrees=10),
+        transforms.ToTensor(),
+    ])
+    Train_Dataset = modules.AE_Dataset(
+        root_dir="archive/chest_xray/chest_xray/train/PNEUMONIA",
+        transform=transform,
+        should_invert=False,
+        n=500
+    )
+    train_dataloader = DataLoader(
+        Train_Dataset, 
+        shuffle=True, 
+        batch_size=36
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = modules.AutoEncoder().to(device)
+    criterion = nn.SmoothL1Loss(beta=0.04)
+    optimizer = torch.optim.Adam(net.parameters(), 0.001)
+    
+    # 初始化记录loss的列表[2,3](@ref)
+    epoch_losses = []  # 记录每个epoch的平均loss
+    batch_losses = []  # 记录每个batch的loss（用于更详细的曲线）
+    all_epochs = []    # 记录epoch数
+    fixed_samples = []
+    sample_count = 0
+    for data in train_dataloader:
+        if sample_count >= 10:
+            break
+        fixed_samples.append(data[:1])  # 取batch中的第一张
+        sample_count += 1
+    
+    # 将固定样本转换为张量并移到设备
+    fixed_samples = torch.cat(fixed_samples, dim=0).to(device)
+    
+    for epoch in range(1200):
+        net.train()
+        train_loss = 0.0
+        start_time = time.time()
+        
+
+        
+        for batch_id, (data) in enumerate(train_dataloader):
+            data = data.to(device)
+            
+            optimizer.zero_grad()
+            output, code = net(data)
+            loss = criterion(data, output)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            # 记录每个batch的loss[2](@ref)
+            batch_losses.append(loss.item())
+            
+            # 每10个batch打印一次进度
+            if batch_id % 10 == 0:
+                avg_loss = train_loss / (batch_id + 1)
+                print(f"Epoch {epoch+1}/1200 | Batch {batch_id} | Loss: {avg_loss:.4f}")
+        
+        # 计算并记录本epoch的平均loss[3](@ref)
+        epoch_time = time.time() - start_time
+        avg_loss = train_loss / len(train_dataloader)
+        epoch_losses.append(avg_loss)
+        all_epochs.append(epoch + 1)
+        print(f"Epoch {epoch+1} completed | Avg Loss: {avg_loss:.4f} | Time: {epoch_time:.2f}s")
+        
+        # 每5个epoch保存一次模型和loss曲线图
+        if (epoch + 1) % 5 == 0:
+            # 保存模型
+            model_path = f"pth/model_epoch_{epoch+1}.pth"
+            torch.save(net.state_dict(), model_path)
+            print(f"Model saved to {model_path}")
+            
+            # 生成并保存loss走势图[3,4](@ref)
+            plt.figure(figsize=(10, 6))
+            
+            # 绘制每个epoch的平均loss曲线
+            plt.subplot(2, 1, 1)
+            plt.plot(all_epochs, epoch_losses, 'b-', label='Epoch Loss')
+            plt.title(f'Training Loss Curve (Epoch {epoch+1})')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            
+            # 绘制更详细的batch loss曲线（最近500个batch）
+            plt.subplot(2, 1, 2)
+            recent_batches = min(500, len(batch_losses))
+            batch_range = list(range(len(batch_losses) - recent_batches + 1, len(batch_losses) + 1))
+            plt.plot(batch_range, batch_losses[-recent_batches:], 'r-', alpha=0.7, label='Batch Loss')
+            plt.title('Recent Batch Losses')
+            plt.xlabel('Batch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.tight_layout()
+            
+            # 保存loss图片
+            loss_plot_path = f"loss_plots/loss_plot_epoch_{epoch+1}.png"
+            plt.savefig(loss_plot_path)
+            plt.close()
+            print(f"Loss plot saved to {loss_plot_path}")
+            
+        if (epoch + 1) % 5 == 0:
+            # ... 原有保存模型和loss图的代码 ...
+            
+            # 2. 生成并保存重建对比图
+            net.eval()  # 切换到评估模式
+            with torch.no_grad():
+                # 使用固定样本生成重建图像
+                reconstructions, _ = net(fixed_samples)
+                
+                # 准备对比图像网格
+                comparison = torch.cat([fixed_samples, reconstructions], dim=0)
+                
+                # 创建网格图像并保存
+                grid = torchvision.utils.make_grid(
+                    comparison.cpu().data, 
+                    nrow=10,  # 每行显示10张图（原始+重建）
+                    normalize=True,  # 自动归一化到[0,1]
+                    scale_each=True  # 独立缩放每张图像
+                )
+                
+                # 转换为PIL图像并保存
+                grid_image = transforms.ToPILImage()(grid)
+                comparison_path = f"reconstruction_comparisons/epoch_{epoch+1}.png"
+                grid_image.save(comparison_path)
+                print(f"Reconstruction comparison saved to {comparison_path}")
+            
+            net.train()  # 切换回训练模式
+    
+    # 保存最终模型
+    final_path = f"pth/model_final.pth"
+    torch.save(net.state_dict(), final_path)
+    print(f"Training completed. Final model saved to {final_path}")
+    
+    # 训练结束后保存最终loss曲线图[9](@ref)
+    plt.figure(figsize=(10, 5))
+    plt.plot(all_epochs, epoch_losses, 'b-o')
+    plt.title('Final Training Loss Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+    plt.savefig("loss_plots/final_loss_plot.png")
+    plt.close()
+    print("Final loss plot saved.")
+
+if __name__ == "__main__":
+    main()
